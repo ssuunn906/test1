@@ -546,15 +546,13 @@
     const TARGET_GID        = "2115838092";
 
     // PC-스마트폰 공용 클라우드 동기화 스토리지 (무료 영구 KV API)
-    const CLOUD_SYNC_ENDPOINT = "https://api.jsonbin.io/v3/b/67305943ad19ca34f8c8712e";
-    const CLOUD_SYNC_KEY = "$2a$10$w09fO1P5hP88cE7h9h7i4uT.mFhU2eGgZ3lD6qT2aC2x.nS5iE"; // 공용 마스터키
-    // =========================================================================
+    const CLOUD_SYNC_ENDPOINT = "https://kvdb.io/4y9DqH2aK8z3J1L9/moksoo_crm_history_v1";
 
     // 로컬 스토리지 키
-    const STORAGE_KEY_DATA = "moksoo_crm_complaints_v7";
-    const STORAGE_KEY_STATUS_MAP = "moksoo_crm_status_map_v7";
-    const STORAGE_KEY_SHEET_URL = "moksoo_crm_sheet_url_v7";
-    const STORAGE_KEY_FORM_URL = "moksoo_crm_form_url_v7";
+    const STORAGE_KEY_DATA = "moksoo_crm_complaints_v8";
+    const STORAGE_KEY_STATUS_MAP = "moksoo_crm_status_map_v8";
+    const STORAGE_KEY_SHEET_URL = "moksoo_crm_sheet_url_v8";
+    const STORAGE_KEY_FORM_URL = "moksoo_crm_form_url_v8";
 
     // 클라우드 상태 캐시 메모리
     let sharedCloudStatusMap = {};
@@ -562,12 +560,11 @@
     // 클라우드 저장소에서 전체 상태 맵 가져오기
     async function fetchCloudStatusMap() {
       try {
-        const response = await fetch("https://kvdb.io/4y9DqH2aK8z3J1L9/moksoo_crm_history_v1");
+        const response = await fetch(CLOUD_SYNC_ENDPOINT);
         if (response.ok) {
           const data = await response.json();
           if (data && typeof data === 'object') {
             sharedCloudStatusMap = data;
-            // 로컬에도 백업 동기화
             localStorage.setItem(STORAGE_KEY_STATUS_MAP, JSON.stringify(sharedCloudStatusMap));
             return sharedCloudStatusMap;
           }
@@ -576,7 +573,6 @@
         console.log("클라우드 KVDB 동기화 대기 중:", err);
       }
 
-      // KVDB 대기 시 로컬 스토리지 데이터 폴백
       try {
         sharedCloudStatusMap = JSON.parse(localStorage.getItem(STORAGE_KEY_STATUS_MAP) || "{}");
       } catch (e) {
@@ -585,13 +581,12 @@
       return sharedCloudStatusMap;
     }
 
-    // 클라우드 저장소로 상태 맵 푸시 (PC or 폰에서 변경 시 양쪽 즉시 동기화)
+    // 클라우드 저장소로 상태 맵 푸시
     async function pushCloudStatusMap() {
-      // 로컬 스토리지에 즉각 1차 저장
       localStorage.setItem(STORAGE_KEY_STATUS_MAP, JSON.stringify(sharedCloudStatusMap));
 
       try {
-        await fetch("https://kvdb.io/4y9DqH2aK8z3J1L9/moksoo_crm_history_v1", {
+        await fetch(CLOUD_SYNC_ENDPOINT, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(sharedCloudStatusMap)
@@ -601,7 +596,7 @@
       }
     }
 
-    // 고유 식별자 키 생성 (타임스탬프 + 고객명 + 연락처)
+    // 고유 식별자 키 생성
     function getComplaintKey(timestamp, name, phone) {
       return `${String(timestamp || "").trim()}_${String(name || "").trim()}_${String(phone || "").trim()}`.replace(/[\/\s#$[\]]/g, "_");
     }
@@ -722,22 +717,26 @@
       }
       renderAll();
 
-      // 1. 공용 클라우드 동기화 상태 맵 먼저 가져오기
       await fetchCloudStatusMap();
-
-      // 2. 구글 시트 원본 데이터 새로고침
       await refreshData();
 
-      // 10초마다 클라우드 상태 및 시트 백그라운드 자동 동기화 (PC, 폰 실시간 연결)
+      // 15초마다 백그라운드 동기화 (단, 타이핑 작성 중일 때는 입력창 절대 건드리지 않음)
       setInterval(async () => {
         if (!document.hidden) {
           await silentRefreshData();
         }
-      }, 10000);
+      }, 15000);
     }
 
     // 백그라운드 무소음 새로고침
     async function silentRefreshData() {
+      // 사용자가 상세 모달을 띄워두고 작업 중이거나 메모를 작성하고 있으면 입력 방해 방지를 위해 패스
+      const memoEl = document.getElementById("editMemo");
+      const isTyping = memoEl && (document.activeElement === memoEl || memoEl.value.trim().length > 0);
+      if (currentSelectedId && isTyping) {
+        return; // 사용자가 타이핑 중일 때 리셋 방지!
+      }
+
       const sheetId = extractSpreadsheetId(DEFAULT_SHEET_URL);
       const gid = extractGid(DEFAULT_SHEET_URL);
       if (!sheetId) return;
@@ -747,7 +746,7 @@
         const rawList = await fetchGoogleSheetData(sheetId, gid);
         applyParsedRawList(rawList, true);
       } catch (e) {
-        console.log("백그라운드 동기화 진행 중:", e);
+        console.log("백그라운드 동기화 대기 중:", e);
       }
     }
 
@@ -869,10 +868,8 @@
         const defectImg = getFieldByIndexOrPatterns(row, 11, ["하자 부위", "하자 사진", "하자"]);
 
         const key = getComplaintKey(timestamp, name, phone);
-        // PC-폰 공용 클라우드 맵에서 상태 및 히스토리 추출
         const saved = sharedCloudStatusMap[key] || {};
 
-        // 등록된 이력 목록 유지
         const initialHistory = (saved.history && saved.history.length > 0)
           ? saved.history
           : [{ date: timestamp, memo: "구글 폼 접수 완료" }];
@@ -903,10 +900,15 @@
       saveLocalData();
       renderAll();
 
-      // 현재 상세 모달이 열려있다면 내용 실시간 갱신
+      // 상세 모달이 열려 있을 때: 사용자가 입력 중이 아닐 때만 타임라인과 필드 안전 업데이트
       if (currentSelectedId) {
+        const memoEl = document.getElementById("editMemo");
+        const managerEl = document.getElementById("editManager");
+        const isEditing = memoEl && (document.activeElement === memoEl || memoEl.value.trim().length > 0);
+        const isEditingManager = managerEl && (document.activeElement === managerEl);
+
         const openedItem = complaintsData.find(d => d.id === currentSelectedId);
-        if (openedItem) {
+        if (openedItem && !isEditing && !isEditingManager) {
           renderHistoryTimeline(openedItem);
           document.getElementById("editStatus").value = openedItem.status || "신규접수";
           document.getElementById("editManager").value = openedItem.manager || "";
@@ -1195,7 +1197,7 @@
         });
       }
 
-      // 입력창 초기화
+      // 저장 성공 후 입력창 안전 초기화
       document.getElementById("editMemo").value = "";
 
       // 클라우드 공유 맵에 즉시 반영
