@@ -560,7 +560,7 @@
     // 클라우드 저장소에서 전체 상태 맵 가져오기
     async function fetchCloudStatusMap() {
       try {
-        const response = await fetch(CLOUD_SYNC_ENDPOINT);
+        const response = await fetch(CLOUD_SYNC_ENDPOINT + "?t=" + Date.now(), { cache: "no-store" });
         if (response.ok) {
           const data = await response.json();
           if (data && typeof data === 'object') {
@@ -596,9 +596,15 @@
       }
     }
 
-    // 고유 식별자 키 생성
+    // [개선] 기기별 날짜 표기 차이에 영향받지 않는 확실한 고유 식별자 키 생성 (성함 + 숫자만 추출된 전화번호)
     function getComplaintKey(timestamp, name, phone) {
-      return `${String(timestamp || "").trim()}_${String(name || "").trim()}_${String(phone || "").trim()}`.replace(/[\/\s#$[\]]/g, "_");
+      const cleanName = String(name || "").trim().toLowerCase();
+      const cleanPhone = String(phone || "").replace(/[^0-9]/g, ""); // 하이픈, 띄어쓰기 전부 제거한 순수 숫자
+      if (cleanName && cleanPhone) {
+        return `client_${cleanName}_${cleanPhone}`;
+      }
+      // 전화번호가 없는 경우 보조 키
+      return `client_${cleanName}_${String(timestamp || "").trim()}`.replace(/[\/\s#$[\]:.]/g, "_");
     }
 
     // 구글 드라이브 링크를 브라우저에서 바로 보이는 이미지 URL로 변환
@@ -870,7 +876,7 @@
         const key = getComplaintKey(timestamp, name, phone);
         const saved = sharedCloudStatusMap[key] || {};
 
-        const initialHistory = (saved.history && saved.history.length > 0)
+        const initialHistory = (saved.history && Array.isArray(saved.history) && saved.history.length > 0)
           ? saved.history
           : [{ date: timestamp, memo: "구글 폼 접수 완료" }];
 
