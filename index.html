@@ -12,6 +12,28 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  
+  <!-- Firebase SDK 모듈 로드 (실시간 클라우드 동기화용) -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // 전역 스코프로 클라우드 모듈 바인딩
+    window.__cloud = {
+      initializeApp,
+      getAuth,
+      signInAnonymously,
+      signInWithCustomToken,
+      getFirestore,
+      doc,
+      setDoc,
+      onSnapshot,
+      collection
+    };
+    window.dispatchEvent(new CustomEvent('cloud-sdk-ready'));
+  </script>
+
   <style>
     body {
       font-family: 'Noto Sans KR', sans-serif;
@@ -65,6 +87,12 @@
 
         <!-- 우측 액션 버튼들 -->
         <div class="flex items-center space-x-2">
+          <!-- 클라우드 실시간 협업 상태 표시기 -->
+          <div id="cloudStatusBadge" class="hidden sm:inline-flex items-center space-x-1.5 px-2.5 py-1 text-[11px] font-medium rounded-lg bg-slate-800 text-slate-400 border border-slate-700/80">
+            <span class="w-2 h-2 rounded-full bg-slate-500 animate-pulse" id="cloudDot"></span>
+            <span id="cloudStatusText">클라우드 연결 대기</span>
+          </div>
+
           <!-- 구글 폼 링크 바로가기 (등록 시 활성화) -->
           <a id="btnOpenFormLink" href="#" target="_blank" class="hidden sm:inline-flex items-center space-x-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white transition shadow">
             <i class="fa-solid fa-arrow-up-right-from-square"></i>
@@ -483,11 +511,129 @@
     // 상태 관리 전역 변수
     let complaintsData = [];
     let currentSelectedId = null;
+    
+    // 클라우드 동기화 인스턴스 변수
+    let cloudDb = null;
+    let cloudAuth = null;
+    let cloudAppId = typeof __app_id !== 'undefined' ? __app_id : 'moksoo-crm-prod';
+    let cloudUnsubscribe = null;
+    let cloudSyncedStateMap = {}; // 클라우드에 영구 저장된 접수건별 [상태, 담당자, 조치기한, 메모] 맵
 
     // 로컬 스토리지 키
     const STORAGE_KEY_DATA = "moksoo_crm_complaints_v3";
     const STORAGE_KEY_SHEET_URL = "moksoo_crm_sheet_url_v3";
     const STORAGE_KEY_FORM_URL = "moksoo_crm_form_url_v3";
+
+    // 클라우드 상태 UI 갱신 함수
+    function updateCloudStatus(status, text) {
+      const dot = document.getElementById("cloudDot");
+      const txt = document.getElementById("cloudStatusText");
+      if (!dot || !txt) return;
+
+      if (status === "connected") {
+        dot.className = "w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]";
+        txt.className = "text-emerald-300 font-medium";
+        txt.innerText = text || "실시간 협업 중";
+      } else if (status === "saving") {
+        dot.className = "w-2 h-2 rounded-full bg-amber-400 animate-ping";
+        txt.className = "text-amber-300 font-medium";
+        txt.innerText = text || "클라우드 저장 중...";
+      } else if (status === "error") {
+        dot.className = "w-2 h-2 rounded-full bg-rose-500";
+        txt.className = "text-rose-300 font-medium";
+        txt.innerText = text || "오프라인 보존 모드";
+      } else {
+        dot.className = "w-2 h-2 rounded-full bg-slate-500";
+        txt.className = "text-slate-400";
+        txt.innerText = text || "클라우드 준비 중";
+      }
+    }
+
+    // 클라우드 실시간 데이터베이스 초기화 및 리스너 가동
+    async function initCloudSync() {
+      if (!window.__cloud) {
+        window.addEventListener('cloud-sdk-ready', () => initCloudSync(), { once: true });
+        return;
+      }
+
+      if (typeof __firebase_config === 'undefined') {
+        updateCloudStatus("error", "로컬 저장 모드");
+        return;
+      }
+
+      try {
+        const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, getFirestore, collection, onSnapshot } = window.__cloud;
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        cloudDb = getFirestore(app);
+        cloudAuth = getAuth(app);
+
+        // 1. 인증 진행 (토큰 우선, 익명 폴백)
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(cloudAuth, __initial_auth_token);
+        } else {
+          await signInAnonymously(cloudAuth);
+        }
+
+        updateCloudStatus("connected", "실시간 협업 동기화 중");
+
+        // 2. 관리 데이터 실시간 구독 (Rule 1 & Rule 2 엄수)
+        const managementCol = collection(cloudDb, 'artifacts', cloudAppId, 'public', 'data', 'crm_management');
+
+        if (cloudUnsubscribe) cloudUnsubscribe();
+
+        cloudUnsubscribe = onSnapshot(managementCol, (snapshot) => {
+          let hasChanges = false;
+          snapshot.forEach(docSnap => {
+            const data = docSnap.data();
+            if (data && data.uniqueKey) {
+              cloudSyncedStateMap[data.uniqueKey] = {
+                status: data.status,
+                manager: data.manager,
+                dueDate: data.dueDate,
+                memo: data.memo,
+                updatedAt: data.updatedAt
+              };
+              hasChanges = true;
+            }
+          });
+
+          // 현재 리스트에 클라우드 변경 사항 병합
+          if (hasChanges && complaintsData.length > 0) {
+            mergeCloudDataIntoList();
+            renderAll();
+          }
+        }, (err) => {
+          console.error("클라우드 구독 에러:", err);
+          updateCloudStatus("error", "오프라인 보존 모드");
+        });
+
+      } catch (err) {
+        console.warn("클라우드 초기화 실패 (로컬 모드 지속):", err);
+        updateCloudStatus("error", "오프라인 보존 모드");
+      }
+    }
+
+    // 클라우드에서 실시간 수신된 상태를 메모리 리스트에 즉시 반영
+    function mergeCloudDataIntoList() {
+      complaintsData.forEach(item => {
+        const key = getUniqueComplaintKey(item);
+        const cloudState = cloudSyncedStateMap[key];
+        if (cloudState) {
+          item.status = cloudState.status || item.status;
+          item.manager = cloudState.manager || item.manager;
+          item.dueDate = cloudState.dueDate || item.dueDate;
+          item.memo = cloudState.memo || item.memo;
+        }
+      });
+      saveLocalData();
+    }
+
+    // 각 접수 건을 구분하는 고유 식별자 키 생성기 (타임스탬프, 성함, 연락처)
+    function getUniqueComplaintKey(item) {
+      const cleanKey = `${item.timestamp || ""}_${item.name || ""}_${item.phone || ""}`.replace(/[\/\s#$[\]]/g, "_");
+      return cleanKey || `item_${item.id}`;
+    }
 
     // 구글 드라이브 링크를 브라우저에서 바로 보이는 이미지 URL로 변환
     function convertDriveLink(url) {
@@ -610,6 +756,9 @@
         // 처음 방문 시 예시 데이터 제공
         loadInitialSample();
       }
+
+      // 클라우드 협업 동기화 시작
+      initCloudSync();
     }
 
     // 첫 화면 샘플 데이터
@@ -742,10 +891,10 @@
         return;
       }
 
-      // 기존 관리 정보(상태, 담당자, 메모) 보존을 위한 맵 생성
+      // 기존 관리 정보(로컬 및 클라우드 상태) 보존을 위한 맵 생성
       const stateMap = {};
       complaintsData.forEach(item => {
-        const key = `${item.timestamp}_${item.name}_${item.phone}`;
+        const key = getUniqueComplaintKey(item);
         stateMap[key] = {
           status: item.status,
           manager: item.manager,
@@ -772,8 +921,10 @@
         const contractImg = getFieldByIndexOrPatterns(row, 10, ["계약서 사진", "계약서"]);
         const defectImg = getFieldByIndexOrPatterns(row, 11, ["하자 부위", "하자 사진", "하자"]);
 
-        const uniqueKey = `${timestamp}_${name}_${phone}`;
-        const saved = stateMap[uniqueKey] || {};
+        const rawItem = { timestamp, name, phone, id: idx + 1 };
+        const uniqueKey = getUniqueComplaintKey(rawItem);
+        // 클라우드 저장값 우선 > 로컬 저장값 > 기본값
+        const saved = cloudSyncedStateMap[uniqueKey] || stateMap[uniqueKey] || {};
 
         newList.push({
           id: idx + 1,
@@ -999,21 +1150,62 @@
       currentSelectedId = null;
     }
 
-    // 상세 관리 정보 저장
-    function saveCurrentDetailChanges() {
+    // 상세 관리 정보 저장 (클라우드 실시간 전송 및 로컬 저장)
+    async function saveCurrentDetailChanges() {
       if (!currentSelectedId) return;
       const item = complaintsData.find(d => d.id === currentSelectedId);
       if (!item) return;
 
-      item.status = document.getElementById("editStatus").value;
-      item.manager = document.getElementById("editManager").value.trim();
-      item.dueDate = document.getElementById("editDueDate").value;
-      item.memo = document.getElementById("editMemo").value.trim();
+      const newStatus = document.getElementById("editStatus").value;
+      const newManager = document.getElementById("editManager").value.trim();
+      const newDueDate = document.getElementById("editDueDate").value;
+      const newMemo = document.getElementById("editMemo").value.trim();
 
+      item.status = newStatus;
+      item.manager = newManager;
+      item.dueDate = newDueDate;
+      item.memo = newMemo;
+
+      const uniqueKey = getUniqueComplaintKey(item);
+
+      // 1. 로컬 저장 및 화면 갱신
       saveLocalData();
       renderAll();
       closeDetailModal();
-      showNotification("조치 내용이 성공적으로 저장되었습니다.", "success");
+
+      // 2. 클라우드 실시간 저장 (다른 모든 직원 및 기기에 즉시 반영)
+      if (cloudDb && window.__cloud) {
+        updateCloudStatus("saving", "클라우드 저장 중...");
+        try {
+          const { doc, setDoc } = window.__cloud;
+          const docRef = doc(cloudDb, 'artifacts', cloudAppId, 'public', 'data', 'crm_management', uniqueKey);
+          
+          await setDoc(docRef, {
+            uniqueKey: uniqueKey,
+            status: newStatus,
+            manager: newManager,
+            dueDate: newDueDate,
+            memo: newMemo,
+            updatedAt: new Date().toISOString()
+          }, { merge: true });
+
+          cloudSyncedStateMap[uniqueKey] = {
+            status: newStatus,
+            manager: newManager,
+            dueDate: newDueDate,
+            memo: newMemo
+          };
+
+          updateCloudStatus("connected", "실시간 협업 중");
+          showNotification("조치 내용이 클라우드에 영구 저장되었습니다. (전 직원 공유됨)", "success");
+        } catch (err) {
+          console.error("클라우드 저장 실패:", err);
+          updateCloudStatus("error", "오프라인 저장 완료");
+          showNotification("로컬에 저장되었습니다. (클라우드 전송 실패)", "info");
+        }
+      } else {
+        showNotification("조치 내용이 성공적으로 저장되었습니다.", "success");
+      }
     }
 
     // 인쇄 실행
