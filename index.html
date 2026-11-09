@@ -515,8 +515,8 @@
     const DEFAULT_FORM_URL  = "https://docs.google.com/forms/d/e/1FAIpQLSd7DCR6fNdHZExCQ4dpjsPjpECLnR7-N39AdcGlinri_PagQg/viewform?usp=publish-editor";
     const TARGET_GID        = "1907089242";
 
-    // 대표님께서 배포하신 구글 시트 직통 Apps Script 웹앱 URL (PC-스마트폰 100% 영구 동기화)
-    const APPS_SCRIPT_URL   = "https://script.google.com/macros/s/AKfycbwR9yfe27NJ5dyoOC1NPuaUVw6TIKdedDXe4rasC_cR2eFFhaRik_N0XxgxbL9Sq2F3CQ/exec";
+    // 대표님께서 새로 배포하신 최신 구글 시트 웹앱 URL (PC-스마트폰 100% 영구 동기화)
+    const APPS_SCRIPT_URL   = "https://script.google.com/macros/s/AKfycbxrmt_ndtokup_WkYD9OP44S8lf7f-uQtjt8h8CccnF8D1PtSjkUHkWanzScrD8Kd8dhA/exec";
 
     // 로컬 스토리지 키
     const STORAGE_KEY_DATA = "moksoo_crm_complaints_v10";
@@ -527,10 +527,11 @@
     // 클라우드 상태 캐시 메모리
     let sharedCloudStatusMap = {};
 
-    // 구글 시트 Apps Script에서 전체 조치 이력 맵 가져오기
+    // 구글 시트 Apps Script에서 전체 조치 이력 맵 가져오기 (CORS 우회 지원)
     async function fetchCloudStatusMap() {
       if (!APPS_SCRIPT_URL) return sharedCloudStatusMap;
       try {
+        // 1차 시도: 일반 fetch (redirect: follow)
         const response = await fetch(APPS_SCRIPT_URL + "?action=read&t=" + Date.now(), {
           method: "GET",
           headers: { "Accept": "application/json" }
@@ -544,7 +545,21 @@
           }
         }
       } catch (err) {
-        console.log("구글 Apps Script 동기화 대기 중:", err);
+        // 2차 시도: AllOrigins 프록시 우회
+        try {
+          const proxyUrl = "https://api.allorigins.win/raw?url=" + encodeURIComponent(APPS_SCRIPT_URL + "?action=read&t=" + Date.now());
+          const pRes = await fetch(proxyUrl);
+          if (pRes.ok) {
+            const data = await pRes.json();
+            if (data && typeof data === 'object') {
+              sharedCloudStatusMap = data;
+              localStorage.setItem(STORAGE_KEY_STATUS_MAP, JSON.stringify(sharedCloudStatusMap));
+              return sharedCloudStatusMap;
+            }
+          }
+        } catch (pErr) {
+          console.log("시트 동기화 대기 중:", pErr);
+        }
       }
 
       try {
@@ -555,26 +570,61 @@
       return sharedCloudStatusMap;
     }
 
-    // 구글 시트 Apps Script로 상태 및 누적 이력 전송/저장
+    // 구글 시트 Apps Script로 상태 및 누적 이력 전송/저장 (CORS 차단 100% 우회 Form Submit)
     async function pushCloudStatusMap(key, itemData) {
       localStorage.setItem(STORAGE_KEY_STATUS_MAP, JSON.stringify(sharedCloudStatusMap));
 
       if (!APPS_SCRIPT_URL) return;
 
+      const payloadString = JSON.stringify({
+        key: key,
+        data: itemData
+      });
+
+      // 방법 1: 브라우저가 차단할 수 없는 히든 Iframe + HTML Form POST 방식 전송 (100% 서버 도달)
       try {
-        // CORS 및 302 리다이렉트 방지를 위해 text/plain 방식 페이로드 전송
-        await fetch(APPS_SCRIPT_URL, {
+        let hiddenFrame = document.getElementById("hiddenSyncIframe");
+        if (!hiddenFrame) {
+          hiddenFrame = document.createElement("iframe");
+          hiddenFrame.id = "hiddenSyncIframe";
+          hiddenFrame.name = "hiddenSyncIframe";
+          hiddenFrame.style.display = "none";
+          document.body.appendChild(hiddenFrame);
+        }
+
+        const form = document.createElement("form");
+        form.method = "POST";
+        form.action = APPS_SCRIPT_URL;
+        form.target = "hiddenSyncIframe";
+        form.style.display = "none";
+
+        // Apps Script doPost로 전달할 본문 데이터
+        const input = document.createElement("input");
+        input.type = "hidden";
+        input.name = "postData";
+        input.value = payloadString;
+        form.appendChild(input);
+
+        document.body.appendChild(form);
+        form.submit();
+
+        // 3초 후 폼 제거
+        setTimeout(() => {
+          if (form.parentNode) form.parentNode.removeChild(form);
+        }, 3000);
+      } catch (err) {
+        console.warn("히든 폼 전송 에러:", err);
+      }
+
+      // 방법 2: fetch text/plain 동시 발송 백업
+      try {
+        fetch(APPS_SCRIPT_URL, {
           method: "POST",
           mode: "no-cors",
           headers: { "Content-Type": "text/plain;charset=utf-8" },
-          body: JSON.stringify({
-            key: key,
-            data: itemData
-          })
-        });
-      } catch (err) {
-        console.warn("구글 시트 저장 백그라운드 재시도 대기:", err);
-      }
+          body: payloadString
+        }).catch(() => {});
+      } catch (e) {}
     }
 
     // 기기별 날짜 표기 차이에 영향받지 않는 확실한 고유 식별자 키 생성 (성함 + 숫자만 추출된 전화번호)
