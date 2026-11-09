@@ -67,8 +67,8 @@
         <div class="flex items-center space-x-2">
           <!-- 기기 간 실시간 동기화 상태 뱃지 -->
           <div class="hidden sm:inline-flex items-center space-x-1.5 px-2.5 py-1 text-[11px] font-medium rounded-lg bg-slate-800 text-slate-300 border border-slate-700/80">
-            <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-            <span id="syncDeviceNotice">PC·모바일 시트 동기화</span>
+            <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" id="cloudPulse"></span>
+            <span id="syncDeviceNotice">PC·스마트폰 실시간 동기화 중</span>
           </div>
 
           <!-- 구글 폼 링크 바로가기 (등록 시 활성화) -->
@@ -359,7 +359,7 @@
 
           <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div>
-              <label class="block text-[11px] font-medium text-slate-500 mb-1">진행 상태</label>
+              <label class="block text-[11px] font-medium text-slate-500 mb-1">진행 상태 변경</label>
               <select id="editStatus" class="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 font-semibold">
                 <option value="신규접수">신규접수</option>
                 <option value="업체전달">업체전달</option>
@@ -378,9 +378,33 @@
             </div>
           </div>
 
+          <!-- 신규 메모 작성 영역 -->
           <div>
-            <label class="block text-[11px] font-medium text-slate-500 mb-1">업체 소통 및 조치 메모</label>
-            <textarea id="editMemo" rows="3" placeholder="협력업체 대표 통화 내용, 일정 조율 사항, 조치 내역을 기록하세요..." class="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 focus:ring-2 focus:ring-amber-500"></textarea>
+            <label class="block text-[11px] font-medium text-slate-500 mb-1 flex items-center justify-between">
+              <span>새로운 조치 내용 및 통화 메모 작성</span>
+              <span class="text-[10px] text-slate-400">저장 시 아래 이력 목록으로 즉시 업로드됩니다</span>
+            </label>
+            <div class="flex gap-2">
+              <textarea id="editMemo" rows="2" placeholder="예: 협력업체 대표 통화 완료, 11월 15일 재방문 실측 약속..." class="flex-1 text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 focus:ring-2 focus:ring-amber-500 focus:bg-white transition"></textarea>
+              <button type="button" onclick="saveCurrentDetailChanges()" class="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-lg transition shadow flex flex-col items-center justify-center min-w-[90px] gap-1">
+                <i class="fa-solid fa-cloud-arrow-up text-sm"></i>
+                <span>내역 등록</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- 누적된 조치 이력 타임라인 리스트 -->
+          <div class="mt-4 pt-3 border-t border-slate-100">
+            <div class="flex items-center justify-between mb-2">
+              <label class="text-xs font-bold text-slate-700 flex items-center space-x-1.5">
+                <i class="fa-solid fa-clock-rotate-left text-slate-500"></i>
+                <span>누적 조치 히스토리</span>
+              </label>
+              <span id="historyCountBadge" class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600">0건</span>
+            </div>
+            <div id="modalHistoryTimeline" class="space-y-2 max-h-56 overflow-y-auto custom-scroll pr-1">
+              <!-- 자바스크립트로 동적 렌더링 -->
+            </div>
           </div>
         </div>
 
@@ -388,13 +412,10 @@
 
       <!-- 모달 푸터 버튼 -->
       <div class="px-6 py-3 bg-slate-100 border-t border-slate-200 flex items-center justify-between">
-        <button type="button" onclick="closeDetailModal()" class="px-4 py-2 text-xs font-medium text-slate-600 hover:text-slate-800 transition">
+        <button type="button" onclick="closeDetailModal()" class="px-4 py-2 text-xs font-semibold text-slate-600 hover:text-slate-800 transition">
           닫기
         </button>
-        <button type="button" onclick="saveCurrentDetailChanges()" class="px-5 py-2 text-xs font-bold rounded-lg bg-slate-900 text-white hover:bg-slate-800 shadow transition flex items-center space-x-1.5">
-          <i class="fa-solid fa-floppy-disk"></i>
-          <span>조치 내역 저장</span>
-        </button>
+        <span class="text-[11px] text-slate-400">내역 등록 시 실시간으로 기록이 보존됩니다.</span>
       </div>
     </div>
   </div>
@@ -512,7 +533,11 @@
   </div>
 
   <!-- 메인 스크립트 로직 -->
-  <script>
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
     // =========================================================================
     // [★ 고정 연동 설정] 구글 시트 및 구글 폼 링크 영구 고정
     // =========================================================================
@@ -524,12 +549,88 @@
     // 상태 관리 전역 변수
     let complaintsData = [];
     let currentSelectedId = null;
+    let cloudStatusMap = {}; // 클라우드에서 동기화되는 조치상태 맵
+
+    // 클라우드 데이터베이스 초기화
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'moksoo-crm-prod';
+    let db = null;
+    let auth = null;
+    let isCloudReady = false;
+
+    try {
+      if (typeof __firebase_config !== 'undefined') {
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        db = getFirestore(app);
+        auth = getAuth(app);
+        
+        // 인증 처리 후 실시간 리스너 연결
+        const initAuth = typeof __initial_auth_token !== 'undefined' 
+          ? signInWithCustomToken(auth, __initial_auth_token)
+          : signInAnonymously(auth);
+
+        initAuth.then(() => {
+          isCloudReady = true;
+          listenToCloudStatus();
+        }).catch(err => {
+          console.warn("클라우드 인증 폴백:", err);
+        });
+      }
+    } catch(e) {
+      console.warn("클라우드 초기화 실패, 로컬 모드로 작동:", e);
+    }
+
+    // 클라우드 실시간 리스너 (PC, 폰 어디서 수정하든 즉시 자동 반영)
+    function listenToCloudStatus() {
+      if (!db || !isCloudReady) return;
+      const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'complaints_status');
+      
+      onSnapshot(colRef, (snapshot) => {
+        let updated = false;
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data();
+          const docKey = docSnap.id;
+          cloudStatusMap[docKey] = data;
+        });
+
+        // 현재 표시된 complaintsData에 최신 클라우드 조치상태 덮어씌우기
+        complaintsData.forEach(item => {
+          const key = getComplaintKey(item.timestamp, item.name, item.phone);
+          if (cloudStatusMap[key]) {
+            const c = cloudStatusMap[key];
+            if (item.status !== c.status || item.manager !== c.manager || item.dueDate !== c.dueDate || item.memo !== c.memo) {
+              item.status = c.status || item.status;
+              item.manager = c.manager || item.manager;
+              item.dueDate = c.dueDate || item.dueDate;
+              item.memo = c.memo || item.memo;
+              updated = true;
+            }
+          }
+        });
+
+        if (updated) {
+          renderAll();
+          // 현재 열려있는 모달이 있다면 폼 데이터도 실시간 동기화
+          if (currentSelectedId) {
+            const currentItem = complaintsData.find(d => d.id === currentSelectedId);
+            if (currentItem) {
+              document.getElementById("editStatus").value = currentItem.status || "신규접수";
+              document.getElementById("editManager").value = currentItem.manager || "";
+              document.getElementById("editDueDate").value = currentItem.dueDate || "";
+              document.getElementById("editMemo").value = currentItem.memo || "";
+            }
+          }
+        }
+      }, (error) => {
+        console.error("클라우드 실시간 동기화 오류:", error);
+      });
+    }
 
     // 로컬 스토리지 키
-    const STORAGE_KEY_DATA = "moksoo_crm_complaints_v5";
-    const STORAGE_KEY_SHEET_URL = "moksoo_crm_sheet_url_v5";
-    const STORAGE_KEY_FORM_URL = "moksoo_crm_form_url_v5";
-    const STORAGE_KEY_STATUS_MAP = "moksoo_crm_status_map_v5";
+    const STORAGE_KEY_DATA = "moksoo_crm_complaints_v6";
+    const STORAGE_KEY_SHEET_URL = "moksoo_crm_sheet_url_v6";
+    const STORAGE_KEY_FORM_URL = "moksoo_crm_form_url_v6";
+    const STORAGE_KEY_STATUS_MAP = "moksoo_crm_status_map_v6";
 
     // 구글 드라이브 링크를 브라우저에서 바로 보이는 이미지 URL로 변환
     function convertDriveLink(url) {
@@ -537,12 +638,10 @@
       const trimmed = url.trim();
       if (!trimmed) return "";
 
-      // 이미 일반 웹 이미지 URL인 경우
       if (trimmed.startsWith("data:") || trimmed.match(/\.(jpeg|jpg|gif|png|webp)($|\?)/i)) {
         return trimmed;
       }
 
-      // 구글 드라이브 파일 ID 추출
       let fileId = null;
       const idMatch = trimmed.match(/id=([a-zA-Z0-9_-]+)/);
       if (idMatch) {
@@ -613,7 +712,6 @@
       if (!row) return "";
       const keys = Object.keys(row);
 
-      // 1. 패턴 키 검색
       for (const pattern of patterns) {
         const foundKey = keys.find(k => k.toLowerCase().includes(pattern.toLowerCase()));
         if (foundKey && row[foundKey] !== undefined && row[foundKey] !== null) {
@@ -622,7 +720,6 @@
         }
       }
 
-      // 2. 인덱스 번호 기반 검색
       if (colIndex < keys.length) {
         const val = String(row[keys[colIndex]] || "").trim();
         return val;
@@ -633,7 +730,6 @@
 
     // 초기화 및 데이터 로드
     function initData() {
-      // 고정 URL을 우선 적용 (PC, 모바일 어디서 열어도 설정창 불필요)
       const activeSheetUrl = DEFAULT_SHEET_URL;
       const activeFormUrl  = DEFAULT_FORM_URL;
 
@@ -659,12 +755,12 @@
       // 시작 시 즉시 실제 구글 시트 데이터 실시간 동기화
       refreshData();
 
-      // PC 및 모바일 주기적 자동 동기화 (20초마다 백그라운드 최신화)
+      // 15초마다 백그라운드 자동 동기화
       setInterval(() => {
         if (!document.hidden) {
           silentRefreshData();
         }
-      }, 20000);
+      }, 15000);
     }
 
     // 백그라운드 무소음 새로고침
@@ -679,33 +775,6 @@
       } catch (e) {
         console.log("백그라운드 동기화 대기중:", e);
       }
-    }
-
-    // 첫 화면 샘플 데이터
-    function loadInitialSample() {
-      complaintsData = [
-        {
-          id: 1,
-          timestamp: "2026. 11. 09. 14:20:15",
-          isOfficialPartner: true,
-          name: "김민수",
-          phone: "01012345678",
-          aptName: "힐스테이트 센트럴",
-          dongHo: "105동 1402호",
-          partnerName: "클린줄눈 / 010-9876-5432",
-          product: "욕실 및 현관 줄눈",
-          contractDate: "2026-10-15",
-          content: "안방 욕실 바닥 타일 사이 줄눈 시공 부위가 들떠서 물이 고입니다. 빠른 하자보수 방문 일정 조율 부탁드립니다.",
-          contractImg: "https://placehold.co/800x600/e2e8f0/475569?text=Contract+Sample",
-          defectImg: "https://placehold.co/800x600/fee2e2/dc2626?text=Defect+Sample",
-          status: "신규접수",
-          manager: "미배정",
-          dueDate: "2026-11-12",
-          memo: "협력업체 대표님께 카카오톡 사진 전달 완료.",
-          history: [{ date: "2026. 11. 09. 14:20", action: "시스템 초기 등록" }]
-        }
-      ];
-      renderAll();
     }
 
     // 구글 폼 열기 버튼 상태 갱신
@@ -724,12 +793,11 @@
       return new Promise((resolve, reject) => {
         const callbackName = "gviz_callback_" + Math.round(1000000 * Math.random());
         const script = document.createElement("script");
-        // gid를 포함하여 설문 응답이 쌓이는 정확한 시트 탭을 지정
         script.src = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=responseHandler:${callbackName}&headers=1&gid=${gid}`;
 
         const timer = setTimeout(() => {
           cleanup();
-          reject(new Error("구글 시트 응답 시간 초과. 시트의 [공유] 권한이 [링크가 있는 모든 사용자 - 뷰어]인지 확인해주세요."));
+          reject(new Error("구글 시트 응답 시간 초과. [공유] 권한을 확인해주세요."));
         }, 10000);
 
         function cleanup() {
@@ -771,7 +839,7 @@
 
         script.onerror = function() {
           cleanup();
-          reject(new Error("구글 시트 호출 차단. 시트 [공유] 설정을 확인해주세요."));
+          reject(new Error("구글 시트 호출 차단. [공유] 설정을 확인해주세요."));
         };
 
         document.body.appendChild(script);
@@ -791,7 +859,7 @@
 
       const refreshIcon = document.getElementById("refreshIcon");
       if (refreshIcon) refreshIcon.classList.add("fa-spin");
-      document.getElementById("syncStatusNotice").innerText = "구글 시트 실시간 동기화 중...";
+      document.getElementById("syncStatusNotice").innerText = "구글 시트 및 클라우드 동기화 중...";
 
       try {
         const rawList = await fetchGoogleSheetData(sheetId, gid);
@@ -805,7 +873,7 @@
       }
     }
 
-    // 고유 식별자 키 생성
+    // 고유 식별자 키 생성 (타임스탬프 + 고객명 + 연락처)
     function getComplaintKey(timestamp, name, phone) {
       return `${String(timestamp || "").trim()}_${String(name || "").trim()}_${String(phone || "").trim()}`.replace(/[\/\s#$[\]]/g, "_");
     }
@@ -817,22 +885,13 @@
         return;
       }
 
-      // 로컬 스토리지에 보존된 진행상태 및 메모 맵 불러오기
+      // 로컬 스토리지 보존 맵 불러오기
       let statusMap = {};
       try {
         statusMap = JSON.parse(localStorage.getItem(STORAGE_KEY_STATUS_MAP) || "{}");
-      } catch(e) {}
-
-      // 현재 메모리 상의 수정사항도 맵에 보존
-      complaintsData.forEach(item => {
-        const key = getComplaintKey(item.timestamp, item.name, item.phone);
-        statusMap[key] = {
-          status: item.status,
-          manager: item.manager,
-          dueDate: item.dueDate,
-          memo: item.memo
-        };
-      });
+      } catch(e) {
+        statusMap = {};
+      }
 
       const newList = [];
       rawList.forEach((row, idx) => {
@@ -852,7 +911,13 @@
         const defectImg = getFieldByIndexOrPatterns(row, 11, ["하자 부위", "하자 사진", "하자"]);
 
         const key = getComplaintKey(timestamp, name, phone);
-        const saved = statusMap[key] || {};
+        // 클라우드 상태 ➔ 로컬 영구 보존 맵 ➔ 기본값
+        const saved = cloudStatusMap[key] || statusMap[key] || {};
+
+        // 기존에 등록된 이력 목록이 있다면 온전히 보존
+        const initialHistory = (saved.history && saved.history.length > 0)
+          ? saved.history
+          : [{ date: timestamp, action: "구글 시트 실시간 수신" }];
 
         newList.push({
           id: idx + 1,
@@ -872,7 +937,7 @@
           manager: saved.manager || "미배정",
           dueDate: saved.dueDate || "",
           memo: saved.memo || "",
-          history: [{ date: timestamp, action: "구글 시트 실시간 수신" }]
+          history: initialHistory
         });
       });
 
@@ -886,9 +951,30 @@
       document.getElementById("syncStatusNotice").innerText = `최근 동기화: ${new Date().toLocaleTimeString("ko-KR")}`;
     }
 
-    // 로컬 스토리지에 저장
+    // 로컬 스토리지에 데이터 및 상태 맵 영구 저장
     function saveLocalData() {
       localStorage.setItem(STORAGE_KEY_DATA, JSON.stringify(complaintsData));
+
+      // 각 접수 건별 상태/메모/히스토리 맵 영구 백업
+      let statusMap = {};
+      try {
+        statusMap = JSON.parse(localStorage.getItem(STORAGE_KEY_STATUS_MAP) || "{}");
+      } catch(e) {
+        statusMap = {};
+      }
+
+      complaintsData.forEach(item => {
+        const key = getComplaintKey(item.timestamp, item.name, item.phone);
+        statusMap[key] = {
+          status: item.status,
+          manager: item.manager,
+          dueDate: item.dueDate,
+          memo: item.memo,
+          history: item.history || []
+        };
+      });
+
+      localStorage.setItem(STORAGE_KEY_STATUS_MAP, JSON.stringify(statusMap));
     }
 
     // 화면 전체 렌더링
@@ -1070,9 +1156,56 @@
       document.getElementById("editStatus").value = item.status || "신규접수";
       document.getElementById("editManager").value = item.manager || "";
       document.getElementById("editDueDate").value = item.dueDate || "";
-      document.getElementById("editMemo").value = item.memo || "";
+      // 입력창은 항상 새로 작성할 수 있도록 비워둠
+      document.getElementById("editMemo").value = "";
+
+      // 누적 히스토리 렌더링
+      renderHistoryTimeline(item);
 
       document.getElementById("detailModal").classList.remove("hidden");
+    }
+
+    // 누적 히스토리 타임라인 렌더링 함수
+    function renderHistoryTimeline(item) {
+      const box = document.getElementById("modalHistoryTimeline");
+      const badge = document.getElementById("historyCountBadge");
+      const list = item.history || [];
+
+      badge.innerText = `${list.length}건`;
+
+      if (list.length === 0) {
+        box.innerHTML = `
+          <div class="p-3 rounded-lg bg-slate-50 border border-dashed border-slate-200 text-center text-slate-400 text-[11px]">
+            등록된 조치 이력이 아직 없습니다. 위 칸에서 첫 메모를 등록해보세요.
+          </div>
+        `;
+        return;
+      }
+
+      // 최신 등록순으로 정렬 표시
+      const reversed = [...list].reverse();
+      box.innerHTML = reversed.map((h, revIdx) => {
+        const actualIdx = list.length - 1 - revIdx;
+        const statusBadge = h.status ? `<span class="px-1.5 py-0.2 rounded text-[10px] font-bold bg-amber-100 text-amber-800">${h.status}</span>` : "";
+        const managerText = h.manager ? `<span class="text-slate-600 font-semibold">[${h.manager}]</span>` : "";
+
+        return `
+          <div class="p-3 rounded-xl bg-slate-50 border border-slate-200/90 text-xs hover:border-slate-300 transition">
+            <div class="flex items-center justify-between gap-1 mb-1.5">
+              <div class="flex items-center space-x-1.5 text-[11px]">
+                <i class="fa-solid fa-circle-dot text-[8px] text-amber-500"></i>
+                <span class="font-bold text-slate-800 font-mono">${h.date || "-"}</span>
+                ${managerText}
+                ${statusBadge}
+              </div>
+              <button onclick="deleteHistoryItem(${item.id}, ${actualIdx})" class="text-slate-400 hover:text-red-500 text-[11px] px-1 transition" title="이력 삭제">
+                <i class="fa-regular fa-trash-can"></i>
+              </button>
+            </div>
+            <p class="text-slate-700 whitespace-pre-wrap leading-relaxed text-xs pl-3 border-l-2 border-slate-200">${h.action || h.memo || "내용 없음"}</p>
+          </div>
+        `;
+      }).join("");
     }
 
     // 상세 모달 닫기
@@ -1081,38 +1214,107 @@
       currentSelectedId = null;
     }
 
-    // 상세 관리 정보 저장 (클라우드 실시간 전송 및 로컬 저장)
-    // 상세 관리 정보 저장
+    // 상세 관리 정보 저장 및 이력 업로드
     function saveCurrentDetailChanges() {
       if (!currentSelectedId) return;
       const item = complaintsData.find(d => d.id === currentSelectedId);
       if (!item) return;
 
-      item.status = document.getElementById("editStatus").value;
-      item.manager = document.getElementById("editManager").value.trim();
-      item.dueDate = document.getElementById("editDueDate").value;
-      item.memo = document.getElementById("editMemo").value.trim();
+      const newStatus = document.getElementById("editStatus").value;
+      const newManager = document.getElementById("editManager").value.trim();
+      const newDueDate = document.getElementById("editDueDate").value;
+      const newMemo = document.getElementById("editMemo").value.trim();
 
-      // 상태 보존 맵에 기록
-      let statusMap = {};
-      try {
-        statusMap = JSON.parse(localStorage.getItem(STORAGE_KEY_STATUS_MAP) || "{}");
-      } catch(e) {}
+      // 상태, 담당자, 기한 업데이트
+      item.status = newStatus;
+      item.manager = newManager;
+      item.dueDate = newDueDate;
 
+      // 만약 메모를 적었거나 상태가 변경되었다면 새 히스토리 카드로 추가
+      if (!item.history) item.history = [];
+      const nowStr = new Date().toLocaleString("ko-KR", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+
+      if (newMemo) {
+        item.history.push({
+          date: nowStr,
+          status: newStatus,
+          manager: newManager || "사무국",
+          memo: newMemo
+        });
+        item.memo = newMemo;
+      } else {
+        item.history.push({
+          date: nowStr,
+          status: newStatus,
+          manager: newManager || "사무국",
+          memo: `[상태 갱신] ${newStatus} (조치기한: ${newDueDate || '미정'})`
+        });
+      }
+
+      // 입력창 비우기
+      document.getElementById("editMemo").value = "";
+
+      // 로컬 스토리지에 즉시 영구 저장
+      saveLocalData();
+
+      // 클라우드 동기화 객체에도 갱신
       const key = getComplaintKey(item.timestamp, item.name, item.phone);
-      statusMap[key] = {
-        status: item.status,
-        manager: item.manager,
-        dueDate: item.dueDate,
-        memo: item.memo
-      };
-      localStorage.setItem(STORAGE_KEY_STATUS_MAP, JSON.stringify(statusMap));
+      if (db && isCloudReady) {
+        try {
+          const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'complaints_status', key);
+          setDoc(docRef, {
+            status: item.status,
+            manager: item.manager,
+            dueDate: item.dueDate,
+            memo: item.memo,
+            history: item.history
+          }, { merge: true });
+        } catch(e) {
+          console.warn("클라우드 히스토리 백업 실패:", e);
+        }
+      }
+
+      renderAll();
+      renderHistoryTimeline(item);
+      showNotification("새로운 조치 내역이 등록(업로드)되었습니다.", "success");
+    }
+
+    // 히스토리 항목 삭제 기능
+    function deleteHistoryItem(itemId, histIdx) {
+      const item = complaintsData.find(d => d.id === itemId);
+      if (!item || !item.history || !item.history[histIdx]) return;
+
+      item.history.splice(histIdx, 1);
+      if (item.history.length > 0) {
+        const last = item.history[item.history.length - 1];
+        item.memo = last.memo || last.action || "";
+      } else {
+        item.memo = "";
+      }
 
       saveLocalData();
+
+      const key = getComplaintKey(item.timestamp, item.name, item.phone);
+      if (db && isCloudReady) {
+        try {
+          const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'complaints_status', key);
+          setDoc(docRef, {
+            status: item.status,
+            manager: item.manager,
+            dueDate: item.dueDate,
+            memo: item.memo,
+            history: item.history
+          }, { merge: true });
+        } catch(e) {}
+      }
+
       renderAll();
-      closeDetailModal();
-      showNotification("조치 내용이 저장되었습니다.", "success");
+      renderHistoryTimeline(item);
+      showNotification("이력이 삭제되었습니다.", "info");
     }
+
+    // 전역 함수 등록
+    window.deleteHistoryItem = deleteHistoryItem;
 
     // 인쇄 실행
     function printCurrentDetail() {
@@ -1142,28 +1344,13 @@
     }
 
     // 연동 설정 저장
-    async function saveConfigSettings() {
+    function saveConfigSettings() {
       const sheetUrl = document.getElementById("configSheetUrl").value.trim();
       const formUrl = document.getElementById("configFormUrl").value.trim();
 
       localStorage.setItem(STORAGE_KEY_SHEET_URL, sheetUrl);
       localStorage.setItem(STORAGE_KEY_FORM_URL, formUrl);
       updateFormButton(formUrl);
-
-      // 클라우드에도 저장하여 스마트폰 접속 시 별도 입력 없이 자동 연동되도록 조치
-      if (cloudDb && window.__cloud) {
-        try {
-          const { doc, setDoc } = window.__cloud;
-          const configDocRef = doc(cloudDb, 'artifacts', cloudAppId, 'public', 'data', 'crm_config', 'settings');
-          await setDoc(configDocRef, {
-            sheetUrl: sheetUrl,
-            formUrl: formUrl,
-            updatedAt: new Date().toISOString()
-          }, { merge: true });
-        } catch (e) {
-          console.log("시트 설정 클라우드 저장 패스:", e);
-        }
-      }
 
       closeConfigModal();
       refreshData();
@@ -1297,6 +1484,22 @@
       renderAll();
       showNotification("화면 테스트용 데이터 1건이 추가되었습니다.", "success");
     }
+
+    // 전역 함수로 등록 (HTML onclick 호환)
+    window.openDetailModal = openDetailModal;
+    window.closeDetailModal = closeDetailModal;
+    window.saveCurrentDetailChanges = saveCurrentDetailChanges;
+    window.openLightbox = openLightbox;
+    window.closeLightbox = closeLightbox;
+    window.openConfigModal = openConfigModal;
+    window.closeConfigModal = closeConfigModal;
+    window.saveConfigSettings = saveConfigSettings;
+    window.handleCsvFileUpload = handleCsvFileUpload;
+    window.exportToCSV = exportToCSV;
+    window.addManualSampleData = addManualSampleData;
+    window.handleFilterChange = handleFilterChange;
+    window.refreshData = refreshData;
+    window.printCurrentDetail = printCurrentDetail;
 
     // 시작 시 실행
     window.addEventListener("DOMContentLoaded", () => {
